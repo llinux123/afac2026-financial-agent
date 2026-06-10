@@ -1,6 +1,10 @@
 """题目级记忆 - 证据缓存与复用"""
 from collections import OrderedDict
-from config.settings import QUERY_CACHE_SIMILARITY, FACT_TABLE_MAX_SIZE
+
+import numpy as np
+from rank_bm25 import BM25Okapi
+
+from config.settings import FACT_TABLE_MAX_SIZE
 from utils.logger import logger
 
 
@@ -11,25 +15,59 @@ class QueryMemory:
         self.cache: OrderedDict[str, dict] = OrderedDict()
         self.fact_table: dict[str, str] = {}  # 跨题目事实表
         self.max_cache_size = 200
+        self._bm25_index: BM25Okapi | None = None
+        self._bm25_dirty: bool = True  # 标记索引是否需要重建
 
     def lookup(self, question: str, keywords: list[str]) -> dict | None:
-        """查找相似问题的缓存（真正的 LRU）"""
-        hit_qid = None
-        hit_entry = None
-        for qid, entry in self.cache.items():
-            cached_keywords = entry.get("keywords", [])
-            similarity = self._jaccard(keywords, cached_keywords)
-            if similarity >= QUERY_CACHE_SIMILARITY:
-                hit_qid = qid
-                hit_entry = entry
-                break
+        """查找相似问题的缓存（BM25 + Jaccard 混合评分 + LRU）"""
+        if not self.cache or not keywords:
+            return None
 
-        if hit_qid:
-            # LRU: 命中后移到末尾，淘汰时优先淘汰最久未使用的
-            self.cache.move_to_end(hit_qid)
-            logger.debug(f"  缓存命中: {hit_qid} (similarity={similarity:.2f})")
-            return hit_entry
+        self._ensure_bm25_index()
+
+        cache_keys = list(self.cache.keys())
+
+        # BM25 评分
+        if self._bm25_index is not None:
+            bm25_scores = self._bm25_index.get_scores(keywords)
+            max_bm25 = bm25_scores.max()
+            bm25_norm = bm25_scores / max_bm25 if max_bm25 > 0 else bm25_scores
+        else:
+            bm25_norm = np.zeros(len(cache_keys))
+
+        # Jaccard 评分
+        jaccard_scores = np.array([
+            self._jaccard(keywords, self.cache[qid].get("keywords", []))
+            for qid in cache_keys
+        ])
+
+        # 综合评分: 0.6 * BM25 + 0.4 * Jaccard
+        combined = 0.6 * bm25_norm + 0.4 * jaccard_scores
+        best_idx = int(np.argmax(combined))
+        best_score = float(combined[best_idx])
+
+        # 动态阈值：0.6
+        if best_score >= 0.6:
+            hit_qid = cache_keys[best_idx]
+            self.cache.move_to_end(hit_qid)  # LRU
+            logger.debug(f"  缓存命中: {hit_qid} (score={best_score:.2f})")
+            return self.cache[hit_qid]
+
         return None
+
+    def _ensure_bm25_index(self):
+        """确保 BM25 索引是最新的"""
+        if self._bm25_dirty:
+            corpus = [entry.get("keywords", []) for entry in self.cache.values()]
+            # BM25Okapi 需要非空语料
+            if corpus and any(len(kws) > 0 for kws in corpus):
+                try:
+                    self._bm25_index = BM25Okapi(corpus)
+                except Exception:
+                    self._bm25_index = None
+            else:
+                self._bm25_index = None
+            self._bm25_dirty = False
 
     def store(
         self,
@@ -53,6 +91,8 @@ class QueryMemory:
         if len(self.cache) > self.max_cache_size:
             evicted_key, _ = self.cache.popitem(last=False)
             logger.debug(f"  缓存淘汰: {evicted_key}")
+
+        self._bm25_dirty = True  # 缓存变更，需要重建 BM25 索引
 
     def add_fact(self, key: str, value: str):
         """添加跨题目事实"""
