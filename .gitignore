@@ -7,4 +7,28 @@ wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+.venv/
+
+# Data directories (raw PDFs, parsed data, indexes, caches)
+data/raw/
+data/parsed/
+data/index/
+data/cache/
+data/submission/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment variables
+.env
+.env.local

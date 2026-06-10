@@ -52,16 +52,40 @@ class ParsedDocument:
         }
 
 
-def detect_doc_type(text: str, filename: str) -> str:
-    """根据文本内容和文件名自动检测文档类型"""
+def _infer_doc_type_from_path(file_path: Path) -> str | None:
+    """从文件所在目录推断文档类型
+
+    目录名与 DOC_TYPES 匹配时直接返回，如：
+    data/raw/insurance/1.pdf → "insurance"
+    data/raw/financial_reports/xxx.PDF → "financial_reports"
+    """
+    from config.settings import DOC_TYPES
+    for parent in [file_path.parent, file_path.parent.parent]:
+        dir_name = parent.name.lower()
+        if dir_name in DOC_TYPES:
+            return dir_name
+    return None
+
+
+def detect_doc_type(text: str, filename: str, file_path: Path | None = None) -> str:
+    """根据文本内容、文件名和目录路径自动检测文档类型
+
+    优先级：目录名 > 关键词匹配
+    """
+    # 优先使用目录名
+    if file_path is not None:
+        dir_type = _infer_doc_type_from_path(file_path)
+        if dir_type:
+            return dir_type
+
+    # 降级：关键词匹配
     scores = {}
-    combined_text = text[:5000] + " " + filename  # 取前5000字+文件名
+    combined_text = text[:5000] + " " + filename
 
     for doc_type, keywords in DOC_TYPE_KEYWORDS.items():
         score = sum(1 for kw in keywords if kw in combined_text)
         scores[doc_type] = score
 
-    # 返回得分最高的类型
     best_type = max(scores, key=scores.get)
     if scores[best_type] == 0:
         logger.warning(f"无法确定文档类型 '{filename}'，默认为 research")
@@ -204,8 +228,8 @@ def parse_single_pdf(pdf_path: Path, doc_id: str | None = None) -> ParsedDocumen
         tables = extract_tables_pdfplumber(str(pdf_path))
         logger.info(f"  提取到 {len(tables)} 个表格")
 
-    # 检测文档类型
-    doc_type = detect_doc_type(raw_text, pdf_path.name)
+    # 检测文档类型（优先使用目录名）
+    doc_type = detect_doc_type(raw_text, pdf_path.name, file_path=pdf_path)
 
     # 提取标题（取前几行非空文本）
     title = _extract_title(raw_text)
@@ -259,14 +283,23 @@ def _extract_title(text: str) -> str:
     return "未知标题"
 
 
+def _find_pdf_files(raw_dir: Path) -> list[Path]:
+    """查找目录下所有 PDF 文件（支持 .pdf 和 .PDF 扩展名）"""
+    pdf_files = []
+    for pattern in ["**/*.pdf", "**/*.PDF", "**/*.Pdf"]:
+        pdf_files.extend(raw_dir.glob(pattern))
+    # 去重并排序
+    return sorted(set(pdf_files))
+
+
 def parse_all_pdfs(raw_dir: Path | None = None) -> list[ParsedDocument]:
-    """批量解析所有 PDF 文件"""
+    """批量解析所有 PDF 文件（支持大小写扩展名）"""
     from config.settings import RAW_DIR
     raw_dir = raw_dir or RAW_DIR
 
-    pdf_files = sorted(raw_dir.glob("**/*.pdf"))
+    pdf_files = _find_pdf_files(raw_dir)
     if not pdf_files:
-        logger.error(f"在 {raw_dir} 中未找到 PDF 文件")
+        logger.error(f"在 {raw_dir} 中未找到 PDF 文件（已尝试 .pdf/.PDF）")
         return []
 
     logger.info(f"发现 {len(pdf_files)} 个 PDF 文件")
