@@ -2,13 +2,21 @@
 import os
 from pathlib import Path
 
+# 加载 .env 文件中的环境变量
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except ImportError:
+    pass
+
 # ============================================================
 # 项目路径
 # ============================================================
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 RAW_DIR = DATA_DIR / "raw"
-PARSED_DIR = DATA_DIR / "parsed"
+PARSED_DIR = DATA_DIR / "parsed"        # 阶段2: 清洗后的解析结果
+CHUNKS_DIR = DATA_DIR / "chunks"         # 阶段3-4: 分块结果
 INDEX_DIR = DATA_DIR / "index"
 CACHE_DIR = DATA_DIR / "cache"
 SUBMISSION_DIR = DATA_DIR / "submission"

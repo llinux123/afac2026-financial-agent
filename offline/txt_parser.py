@@ -190,9 +190,15 @@ def parse_single_txt(txt_path: Path, doc_id: str | None = None) -> ParsedTXTDocu
     return result
 
 
-def parse_all_txt(txt_dir: Path | None = None) -> list[ParsedTXTDocument]:
-    """批量解析目录下所有 TXT 文件"""
+def parse_all_txt(txt_dir: Path | None = None, force: bool = False) -> list[dict]:
+    """批量解析目录下所有 TXT 文件
+
+    断点续跑：检查 PARSED_DIR 中是否已有清洗后的结果，有则跳过。
+    """
+    import json
     from config.settings import RAW_DIR, PARSED_DIR
+    from offline.text_cleaner import clean_text
+
     txt_dir = txt_dir or (RAW_DIR / "regulatory" / "txt")
 
     if not txt_dir.exists():
@@ -207,18 +213,38 @@ def parse_all_txt(txt_dir: Path | None = None) -> list[ParsedTXTDocument]:
     logger.info(f"发现 {len(txt_files)} 个 TXT 文件")
 
     PARSED_DIR.mkdir(parents=True, exist_ok=True)
-    documents = []
+    documents: list[dict] = []
+    skipped = 0
 
     for txt_path in txt_files:
+        doc_id = txt_path.stem
+        output_path = PARSED_DIR / f"{doc_id}.json"
+
+        # 断点续跑：检查是否已有清洗后的结果
+        if not force and output_path.exists():
+            try:
+                with open(output_path, "r", encoding="utf-8") as f:
+                    doc_data = json.load(f)
+                documents.append(doc_data)
+                skipped += 1
+                continue
+            except Exception:
+                pass  # 文件损坏，重新解析
+
         try:
             parsed = parse_single_txt(txt_path)
-            # 保存解析结果
-            output_path = PARSED_DIR / f"{parsed.doc_id}.json"
+            # 清洗
+            parsed.raw_text = clean_text(parsed.raw_text, parsed.doc_type)
+            doc_data = parsed.to_dict()
+            # 保存清洗后的结果
             with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(parsed.to_dict(), f, ensure_ascii=False, indent=2)
-            documents.append(parsed)
+                json.dump(doc_data, f, ensure_ascii=False, indent=2)
+            documents.append(doc_data)
         except Exception as e:
             logger.error(f"TXT 解析失败 '{txt_path.name}': {e}")
 
-    logger.info(f"成功解析 {len(documents)}/{len(txt_files)} 个 TXT 文档")
+    logger.info(
+        f"TXT 解析完成: {len(documents)}/{len(txt_files)} 个文档"
+        f" (跳过已有: {skipped}, 新解析: {len(documents) - skipped})"
+    )
     return documents

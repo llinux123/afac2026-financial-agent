@@ -1,5 +1,7 @@
 """文档级三层摘要生成 (离线阶段)"""
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import jieba
@@ -80,10 +82,26 @@ def generate_summaries_for_doc(
 def generate_all_summaries(
     client: QwenClient,
     parsed_dir: Path | None = None,
+    force: bool = False,
+    max_workers: int = 4,
 ) -> DocMemory:
-    """为所有已解析文档生成摘要"""
+    """为所有已解析文档生成摘要（多线程并发）
+
+    断点续跑：先加载已有摘要，跳过已完成的文档，每处理完一个立即保存。
+    使用 ThreadPoolExecutor 并发处理多个文档，适合 I/O 密集型 API 调用。
+
+    Args:
+        client: Qwen API 客户端
+        parsed_dir: 已解析文档目录
+        force: 是否强制重新生成所有摘要
+        max_workers: 最大并发线程数，默认 4
+    """
     parsed_dir = parsed_dir or PARSED_DIR
     doc_memory = DocMemory()
+
+    # 加载已有摘要（断点续跑）
+    if not force:
+        doc_memory.load()
 
     # 加载所有已解析文档
     parsed_files = sorted(parsed_dir.glob("*.json"))
@@ -91,30 +109,73 @@ def generate_all_summaries(
         logger.error(f"在 {parsed_dir} 中未找到解析文件")
         return doc_memory
 
-    logger.info(f"开始生成 {len(parsed_files)} 个文档的摘要...")
+    # 过滤待处理文档列表（断点续跑：跳过已有摘要）
+    files_to_process = [
+        pf for pf in parsed_files
+        if force or _doc_id_from_path(pf) not in doc_memory.memories
+    ]
+    skipped = len(parsed_files) - len(files_to_process)
 
-    for pf in tqdm(parsed_files, desc="生成摘要"):
-        with open(pf, "r", encoding="utf-8") as f:
-            doc_data = json.load(f)
+    logger.info(
+        f"摘要生成: 共 {len(parsed_files)} 个文档, "
+        f"跳过已有: {skipped}, 待处理: {len(files_to_process)}"
+    )
 
-        doc_id = doc_data["doc_id"]
-        text = doc_data["raw_text"]
-        doc_type = doc_data["doc_type"]
+    if not files_to_process:
+        logger.info("没有需要处理的文档")
+        return doc_memory
 
+    # 线程锁：保护 doc_memory 的读写操作
+    lock = threading.Lock()
+
+    def process_single_doc(pf: Path) -> str | None:
+        """Worker function: 处理单个文档并线程安全地保存"""
+        doc_id = _doc_id_from_path(pf)
         try:
+            with open(pf, "r", encoding="utf-8") as f:
+                doc_data = json.load(f)
+
+            text = doc_data["raw_text"]
+            doc_type = doc_data["doc_type"]
+
+            # API 调用（I/O 密集型，不需要锁）
             result = generate_summaries_for_doc(doc_id, text, doc_type, client)
-            doc_memory.add_document(
-                doc_id=doc_id,
-                l1_summary=result["l1_summary"],
-                l2_summary=result["l2_summary"],
-                l3_summary=result["l3_summary"],
-                keywords=result["keywords"],
-                metadata=doc_data.get("metadata", {}),
-            )
+
+            # 线程安全地写入 doc_memory 并持久化
+            with lock:
+                doc_memory.add_document(
+                    doc_id=doc_id,
+                    l1_summary=result["l1_summary"],
+                    l2_summary=result["l2_summary"],
+                    l3_summary=result["l3_summary"],
+                    keywords=result["keywords"],
+                    metadata=doc_data.get("metadata", {}),
+                )
+                doc_memory.save()
+
+            return doc_id
         except Exception as e:
             logger.error(f"生成摘要失败 {doc_id}: {e}")
+            return None
 
-    # 保存
-    doc_memory.save()
-    logger.info(f"所有摘要生成完成: {len(doc_memory.memories)} 个文档")
+    # 使用 ThreadPoolExecutor 并发处理
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(process_single_doc, pf): pf
+            for pf in files_to_process
+        }
+        with tqdm(total=len(files_to_process), desc="生成摘要") as pbar:
+            for future in as_completed(futures):
+                future.result()  # 异常已在 worker 内处理
+                pbar.update(1)
+
+    logger.info(
+        f"摘要生成完成: {len(doc_memory.memories)}/{len(parsed_files)} 个文档"
+        f" (本次新处理: {len(doc_memory.memories) - skipped})"
+    )
     return doc_memory
+
+
+def _doc_id_from_path(path: Path) -> str:
+    """从文件路径提取 doc_id"""
+    return path.stem

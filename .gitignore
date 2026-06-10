@@ -12,6 +12,7 @@ wheels/
 # Data directories (raw PDFs, parsed data, indexes, caches)
 data/raw/
 data/parsed/
+data/chunks/
 data/index/
 data/cache/
 data/submission/

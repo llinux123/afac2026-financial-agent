@@ -1,11 +1,14 @@
 """多层次文档分块引擎"""
+import json
 import re
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 
 from config.settings import (
     CHUNK_SIZE_L2_MIN, CHUNK_SIZE_L2_MAX,
     CHUNK_SIZE_L3_MIN, CHUNK_SIZE_L3_MAX,
     CHUNK_SIZE_L4_MAX, CHUNK_OVERLAP,
+    CHUNKS_DIR,
 )
 from config.doc_type_config import CHUNK_STRATEGIES, SECTION_PATTERNS
 from offline.structure_extractor import DocumentStructure, Section
@@ -296,14 +299,34 @@ def _split_sentences(text: str) -> list[str]:
 def chunk_all_documents(
     parsed_docs: list[dict],
     structures: dict[str, DocumentStructure],
+    force: bool = False,
 ) -> dict[str, list[Chunk]]:
-    """对所有文档执行分块"""
+    """对所有文档执行分块
+
+    断点续跑：检查 CHUNKS_DIR 中是否已有分块结果，有则跳过。
+    每个文档分块后立即保存到 CHUNKS_DIR/{doc_id}.json。
+    """
     chunker = Chunker()
     all_chunks: dict[str, list[Chunk]] = {}
+    CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
+    skipped = 0
 
     for doc_data in parsed_docs:
         doc_id = doc_data["doc_id"]
         doc_type = doc_data["doc_type"]
+        chunks_path = CHUNKS_DIR / f"{doc_id}.json"
+
+        # 断点续跑：检查是否已有分块结果
+        if not force and chunks_path.exists():
+            try:
+                chunks = _load_chunks_from_file(chunks_path)
+                if chunks:
+                    all_chunks[doc_id] = chunks
+                    skipped += 1
+                    continue
+            except Exception:
+                pass  # 文件损坏，重新分块
+
         text = doc_data["raw_text"]
         structure = structures.get(doc_id)
 
@@ -315,6 +338,59 @@ def chunk_all_documents(
         chunks = chunker.chunk_document(text, structure, doc_id, doc_type)
         all_chunks[doc_id] = chunks
 
+        # 立即持久化
+        _save_chunks(chunks, chunks_path)
+
     total = sum(len(v) for v in all_chunks.values())
-    logger.info(f"所有文档分块完成: {len(all_chunks)} 个文档, {total} 个 chunks")
+    logger.info(
+        f"分块完成: {len(all_chunks)} 个文档, {total} 个 chunks"
+        f" (跳过已有: {skipped}, 新分块: {len(all_chunks) - skipped})"
+    )
+    return all_chunks
+
+
+def _save_chunks(chunks: list[Chunk], path: Path):
+    """保存分块结果到 JSON 文件"""
+    data = [c.to_dict() for c in chunks]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def _load_chunks_from_file(path: Path) -> list[Chunk]:
+    """从 JSON 文件加载分块结果"""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return [
+        Chunk(
+            chunk_id=d["chunk_id"],
+            doc_id=d["doc_id"],
+            doc_type=d["doc_type"],
+            level=d["level"],
+            section_path=d["section_path"],
+            text=d["text"],
+            metadata=d.get("metadata", {}),
+        )
+        for d in data
+    ]
+
+
+def load_all_chunks(chunks_dir: Path | None = None) -> dict[str, list[Chunk]]:
+    """从 CHUNKS_DIR 加载所有已保存的分块结果"""
+    chunks_dir = chunks_dir or CHUNKS_DIR
+    all_chunks: dict[str, list[Chunk]] = {}
+
+    if not chunks_dir.exists():
+        return all_chunks
+
+    for path in sorted(chunks_dir.glob("*.json")):
+        try:
+            chunks = _load_chunks_from_file(path)
+            if chunks:
+                doc_id = chunks[0].doc_id
+                all_chunks[doc_id] = chunks
+        except Exception as e:
+            logger.warning(f"加载分块失败 {path.name}: {e}")
+
+    total = sum(len(v) for v in all_chunks.values())
+    logger.info(f"从磁盘加载分块: {len(all_chunks)} 个文档, {total} 个 chunks")
     return all_chunks
