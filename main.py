@@ -107,16 +107,22 @@ def run_offline(force: bool = False):
     logger.info(f"  Chunk 数: {sum(len(v) for v in all_chunks.values())}")
 
 
-def run_summarize(force: bool = False):
-    """运行文档摘要生成（支持断点续跑）"""
+def run_summarize(force: bool = False, max_workers: int = 6):
+    """运行文档摘要生成（支持断点续跑）
+
+    Args:
+        force: 是否强制重新生成所有摘要。
+        max_workers: 并发线程数，默认 6，有效范围 1-16。
+    """
     from offline.doc_summarizer import generate_all_summaries
 
     logger.info("=" * 60)
-    logger.info(f"开始生成文档摘要{'（强制重跑）' if force else ''}")
+    logger.info(f"开始生成文档摘要{'（强制重跑）' if force else ''}，"
+                f"并发线程数: {max_workers}")
     logger.info("=" * 60)
 
     client = QwenClient()
-    doc_memory = generate_all_summaries(client, force=force)
+    doc_memory = generate_all_summaries(client, force=force, max_workers=max_workers)
     logger.info(f"摘要生成完成，消耗: {client.get_usage().summary()}")
 
 
@@ -203,6 +209,8 @@ def main():
                         help="日志文件路径")
     parser.add_argument("--force", action="store_true",
                         help="强制重新处理（清除所有中间产物，忽略断点续跑）")
+    parser.add_argument("--max-workers", type=int, default=6,
+                        help="摘要生成并发线程数（默认6，范围1-16，超出自动修正）")
     args = parser.parse_args()
 
     # 配置日志文件
@@ -217,7 +225,7 @@ def main():
     if args.mode == "offline":
         run_offline(force=args.force)
     elif args.mode == "summarize":
-        run_summarize(force=args.force)
+        run_summarize(force=args.force, max_workers=args.max_workers)
     elif args.mode == "online":
         if not args.questions:
             logger.error("online 模式需要 --questions 参数")
@@ -225,7 +233,7 @@ def main():
         run_online(args.questions)
     elif args.mode == "all":
         run_offline(force=args.force)
-        run_summarize(force=args.force)
+        run_summarize(force=args.force, max_workers=args.max_workers)
         if args.questions:
             run_online(args.questions)
         else:
