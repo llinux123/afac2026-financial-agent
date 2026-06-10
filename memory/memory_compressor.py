@@ -1,4 +1,4 @@
-"""记忆压缩策略 - TF-IDF 句子排序 + 规则加分"""
+"""记忆压缩策略 - TF-IDF 句子排序 + 规则加分 + 分类型压缩"""
 import re
 import math
 
@@ -24,29 +24,29 @@ class MemoryCompressor:
         if len(evidence) <= max_chars:
             return evidence
 
-        # 中文分句
-        sentences = self._split_sentences(evidence)
-        if not sentences:
-            return evidence[:max_chars]
+        # 自动检测证据类型
+        evidence_type = self._detect_evidence_type(evidence)
 
-        # 如果没有 question，回退到规则压缩
-        if not question:
-            return self._rule_based_compress(evidence, max_chars)
+        if evidence_type == "regulation":
+            return self._compress_regulation(evidence, question, max_chars)
+        elif evidence_type == "table":
+            return self._compress_table(evidence, question, max_chars)
+        else:
+            # narrative 类型：TF-IDF 压缩
+            if not question:
+                return self._rule_based_compress(evidence, max_chars)
 
-        # TF-IDF 句子排序
-        scores = self._tfidf_sentence_scores(sentences, question)
+            sentences = self._split_sentences(evidence)
+            if not sentences:
+                return evidence[:max_chars]
 
-        # 选择高分句子 + 上下文
-        selected_indices = self._select_sentences(sentences, scores, max_chars)
+            scores = self._tfidf_sentence_scores(sentences, question)
+            selected_indices = self._select_sentences(sentences, scores, max_chars)
+            result = "\n".join(sentences[i] for i in sorted(selected_indices))
 
-        # 按原文顺序拼接
-        result = "\n".join(sentences[i] for i in sorted(selected_indices))
-
-        # 最终截断保护
-        if len(result) > max_chars:
-            result = result[:max_chars]
-
-        return result
+            if len(result) > max_chars:
+                result = result[:max_chars]
+            return result
 
     def _split_sentences(self, text: str) -> list[str]:
         """中文分句"""
@@ -183,25 +183,139 @@ class MemoryCompressor:
 
         return result if result else evidence[:max_chars]
 
+    def _detect_evidence_type(self, evidence: str) -> str:
+        """自动检测证据类型: regulation / table / narrative"""
+        lines = evidence.split("\n")
+
+        # 检测法规特征
+        regulation_signals = 0
+        for line in lines[:20]:  # 只看前20行
+            if re.search(r"第[一二三四五六七八九十\d]+条", line):
+                regulation_signals += 2
+            if any(kw in line for kw in ["应当", "必须", "不得", "可以", "禁止"]):
+                regulation_signals += 1
+
+        if regulation_signals >= 4:
+            return "regulation"
+
+        # 检测表格特征
+        table_lines = sum(1 for line in lines if "|" in line or "\t" in line)
+        if table_lines >= 3:
+            return "table"
+
+        return "narrative"
+
+    def _compress_regulation(self, evidence: str, question: str, max_chars: int) -> str:
+        """法规/条款类证据压缩：保留条款结构"""
+        lines = evidence.split("\n")
+        important = []
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            keep = (
+                # 条款编号
+                bool(re.search(r"第[一二三四五六七八九十\d]+条", line)) or
+                # 数字/金额
+                bool(re.search(r"\d+\.?\d*\s*(%|万|亿|元|天|日|月|年)", line)) or
+                # 条件关键词
+                any(kw in line for kw in ["应当", "应", "须", "必须", "不得", "可以", "禁止", "例外", "但是", "但"]) or
+                # 标题
+                line.startswith("第") or line.startswith("##") or line.startswith("[")
+            )
+
+            if keep:
+                important.append(line)
+
+        result = "\n".join(important)
+
+        # 如果保留太多，用 TF-IDF 再精选
+        if len(result) > max_chars and question:
+            sentences = self._split_sentences(result)
+            if sentences:
+                scores = self._tfidf_sentence_scores(sentences, question)
+                selected = self._select_sentences(sentences, scores, max_chars)
+                result = "\n".join(sentences[i] for i in sorted(selected))
+
+        return result[:max_chars] if len(result) > max_chars else result
+
+    def _compress_table(self, evidence: str, question: str, max_chars: int) -> str:
+        """表格类证据压缩：保留表头和关键数据行"""
+        lines = evidence.split("\n")
+        important = []
+
+        # 找到表格部分
+        in_table = False
+        header_kept = False
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                if in_table:
+                    in_table = False
+                continue
+
+            is_table_line = "|" in stripped or "\t" in stripped
+
+            if is_table_line:
+                in_table = True
+                if not header_kept:
+                    # 保留表头（前2行：标题行+分隔行）
+                    important.append(stripped)
+                    header_kept = True
+                    continue
+                # 保留包含数字的数据行
+                if re.search(r"\d", stripped):
+                    important.append(stripped)
+            else:
+                # 非表格行：保留标题和含数字的
+                if stripped.startswith("##") or stripped.startswith("["):
+                    important.append(stripped)
+                elif re.search(r"\d+\.?\d*\s*(%|万|亿|元)", stripped):
+                    important.append(stripped)
+
+        result = "\n".join(important)
+        return result[:max_chars] if len(result) > max_chars else result
+
     def extract_facts(
         self, question: str, answer: str, evidence: str,
     ) -> list[tuple[str, str]]:
-        """从问答过程中提取事实三元组"""
-        facts = []
-
-        # 提取 "X = Y" 模式的事实
+        """从问答过程中提取事实三元组（增强版）"""
+        # 模式定义: (正则, 提取函数, 优先级)
         patterns = [
-            (r"(.{2,15})为(\d+\.?\d*\s*%?)", lambda m: (m.group(1), m.group(2))),
-            (r"(.{2,15})是(\d+\.?\d*\s*(?:万|亿)?元)", lambda m: (m.group(1), m.group(2))),
-            (r"(.{2,15})(?:为|是)(.{2,20}(?:天|日|月|年))", lambda m: (m.group(1), m.group(2))),
+            # 数值事实（高优先级）
+            (r"(.{2,15})为(\d+\.?\d*\s*%)", lambda m: (m.group(1), m.group(2)), 1.0),
+            (r"(.{2,15})是(\d+\.?\d*\s*(?:万|亿)?元)", lambda m: (m.group(1), m.group(2)), 1.0),
+            (r"(.{2,15})为(\d+\.?\d*\s*(?:万|亿)?元)", lambda m: (m.group(1), m.group(2)), 1.0),
+            (r"(.{2,15})(?:为|是)(.{2,20}(?:天|日|月|年))", lambda m: (m.group(1), m.group(2)), 0.9),
+            # 条件/约束事实（中等优先级）
+            (r"(.{2,10})(?:应当?|须|必须)(.{2,30})", lambda m: (m.group(1), "应" + m.group(2)), 0.8),
+            (r"(.{2,10})不得(.{2,30})", lambda m: (m.group(1), "不得" + m.group(2)), 0.8),
+            # 关系事实（较低优先级）
+            (r"(.{2,10})(?:包括|包含|含)([^。！？]{2,30})", lambda m: (m.group(1), "包括" + m.group(2)[:20]), 0.6),
+            # 比较事实
+            (r"(.{2,15})(?:高于|低于|超过|不超过|达到)(.{2,20})", lambda m: (m.group(1), m.group(2)), 0.7),
         ]
 
-        for pattern, extractor in patterns:
+        extracted: dict[str, tuple[str, str, float]] = {}  # key -> (key, value, priority)
+
+        for pattern, extractor, priority in patterns:
             for match in re.finditer(pattern, evidence):
                 try:
                     key, value = extractor(match)
-                    facts.append((key.strip(), value.strip()))
+                    key = key.strip()
+                    value = value.strip()
+                    # 去重：相同key保留高优先级
+                    if key not in extracted or extracted[key][2] < priority:
+                        extracted[key] = (key, value, priority)
                 except Exception:
                     pass
 
-        return facts[:10]
+        # 按优先级排序返回
+        facts = [
+            (item[0], item[1])
+            for item in sorted(extracted.values(), key=lambda x: -x[2])
+        ]
+        return facts[:15]  # 扩大上限从10到15
