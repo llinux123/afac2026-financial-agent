@@ -13,13 +13,22 @@ class QueryMemory:
         self.max_cache_size = 200
 
     def lookup(self, question: str, keywords: list[str]) -> dict | None:
-        """查找相似问题的缓存"""
+        """查找相似问题的缓存（真正的 LRU）"""
+        hit_qid = None
+        hit_entry = None
         for qid, entry in self.cache.items():
             cached_keywords = entry.get("keywords", [])
             similarity = self._jaccard(keywords, cached_keywords)
             if similarity >= QUERY_CACHE_SIMILARITY:
-                logger.debug(f"  缓存命中: {qid} (similarity={similarity:.2f})")
-                return entry
+                hit_qid = qid
+                hit_entry = entry
+                break
+
+        if hit_qid:
+            # LRU: 命中后移到末尾，淘汰时优先淘汰最久未使用的
+            self.cache.move_to_end(hit_qid)
+            logger.debug(f"  缓存命中: {hit_qid} (similarity={similarity:.2f})")
+            return hit_entry
         return None
 
     def store(
