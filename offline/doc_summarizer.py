@@ -1,6 +1,16 @@
-"""文档级三层摘要生成 (离线阶段)"""
+"""文档级三层摘要生成 (离线阶段)
+
+线程池配置常量:
+    MAX_WORKERS_DEFAULT: 默认并发线程数，适用于大多数 I/O 密集型 API 调用场景
+    MAX_WORKERS_UPPER_LIMIT: 线程数上限，防止系统资源过度消耗。
+        设置为 16 是基于以下考量:
+        - 每个线程占用约 8MB 栈空间，16 线程 ≈ 128MB 内存开销
+        - API 服务端通常有并发请求限制，过高并发会触发限流
+        - 文件 I/O 和 JSON 序列化在锁内执行，过高并发会加剧锁竞争
+"""
 import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -12,6 +22,57 @@ from config.prompts import DOC_SUMMARY_L1, DOC_SUMMARY_L2, DOC_SUMMARY_L3
 from memory.doc_memory import DocMemory
 from utils.api_client import QwenClient
 from utils.logger import logger
+
+# ============================================================
+# 线程池配置常量
+# ============================================================
+MAX_WORKERS_DEFAULT: int = 6
+"""默认并发线程数。
+
+适用于大多数 I/O 密集型 API 调用场景，在并发吞吐与资源开销之间取得平衡。
+建议值范围 4-8，当前取中间值 6。
+"""
+
+MAX_WORKERS_UPPER_LIMIT: int = 16
+"""并发线程数上限。
+
+防止用户设置过高线程数导致系统资源过度消耗。超过此值的输入将被自动截断。
+该上限基于以下约束:
+  - 内存: 每线程 ~8MB 栈空间，16 线程 ≈ 128MB
+  - API 限流: 过高并发易触发服务端限流
+  - 锁竞争: doc_memory 的读写需持锁，过高并发加剧竞争
+"""
+
+
+def validate_max_workers(max_workers: int) -> int:
+    """验证并修正线程池大小参数。
+
+    Args:
+        max_workers: 用户指定的并发线程数。
+
+    Returns:
+        经过验证和修正后的有效线程数。
+
+    Raises:
+        ValueError: 当 max_workers 不是整数类型时。
+    """
+    if not isinstance(max_workers, int):
+        raise ValueError(
+            f"max_workers 必须为整数，当前类型: {type(max_workers).__name__}"
+        )
+    if max_workers < 1:
+        logger.warning(
+            f"max_workers={max_workers} 无效（需 >= 1），"
+            f"已修正为 {MAX_WORKERS_DEFAULT}"
+        )
+        return MAX_WORKERS_DEFAULT
+    if max_workers > MAX_WORKERS_UPPER_LIMIT:
+        logger.warning(
+            f"max_workers={max_workers} 超过上限 {MAX_WORKERS_UPPER_LIMIT}，"
+            f"已截断为 {MAX_WORKERS_UPPER_LIMIT}"
+        )
+        return MAX_WORKERS_UPPER_LIMIT
+    return max_workers
 
 
 def extract_doc_keywords(text: str, top_n: int = 50) -> list[str]:
@@ -83,19 +144,32 @@ def generate_all_summaries(
     client: QwenClient,
     parsed_dir: Path | None = None,
     force: bool = False,
-    max_workers: int = 4,
+    max_workers: int = MAX_WORKERS_DEFAULT,
 ) -> DocMemory:
-    """为所有已解析文档生成摘要（多线程并发）
+    """为所有已解析文档生成摘要（多线程并发）。
 
     断点续跑：先加载已有摘要，跳过已完成的文档，每处理完一个立即保存。
     使用 ThreadPoolExecutor 并发处理多个文档，适合 I/O 密集型 API 调用。
 
     Args:
-        client: Qwen API 客户端
-        parsed_dir: 已解析文档目录
-        force: 是否强制重新生成所有摘要
-        max_workers: 最大并发线程数，默认 4
+        client: Qwen API 客户端，用于调用 LLM 生成摘要。
+        parsed_dir: 已解析文档目录，默认使用 config.settings.PARSED_DIR。
+        force: 是否强制重新生成所有摘要（忽略断点续跑缓存）。
+        max_workers: 最大并发线程数，默认 MAX_WORKERS_DEFAULT(6)。
+            有效范围: 1 ~ MAX_WORKERS_UPPER_LIMIT(16)。
+            超出范围时将自动修正并输出警告日志。
+            建议值: 4-8（I/O 密集型场景），过高值可能导致 API 限流或锁竞争。
+
+    Returns:
+        DocMemory: 包含所有文档摘要的记忆对象。
+
+    Raises:
+        ValueError: 当 max_workers 参数类型不正确时。
     """
+    # 验证并修正线程池大小
+    max_workers = validate_max_workers(max_workers)
+    logger.info(f"线程池大小: {max_workers}")
+
     parsed_dir = parsed_dir or PARSED_DIR
     doc_memory = DocMemory()
 
@@ -128,8 +202,26 @@ def generate_all_summaries(
     # 线程锁：保护 doc_memory 的读写操作
     lock = threading.Lock()
 
+    # 性能监控计数器（线程安全，通过 lock 保护）
+    processed_count = 0
+    failed_count = 0
+    start_time = time.monotonic()
+
     def process_single_doc(pf: Path) -> str | None:
-        """Worker function: 处理单个文档并线程安全地保存"""
+        """Worker function: 处理单个文档并线程安全地保存。
+
+        处理流程:
+        1. 读取并解析文档 JSON（无需锁）
+        2. 调用 LLM API 生成摘要（I/O 密集型，无需锁）
+        3. 获取锁后写入 doc_memory 并持久化（线程安全临界区）
+
+        Args:
+            pf: 待处理的文档 JSON 文件路径。
+
+        Returns:
+            成功时返回 doc_id，失败时返回 None。
+        """
+        nonlocal processed_count, failed_count
         doc_id = _doc_id_from_path(pf)
         try:
             with open(pf, "r", encoding="utf-8") as f:
@@ -152,10 +244,23 @@ def generate_all_summaries(
                     metadata=doc_data.get("metadata", {}),
                 )
                 doc_memory.save()
+                processed_count += 1
 
             return doc_id
+        except json.JSONDecodeError as e:
+            logger.error(f"文档 JSON 解析失败 {doc_id}: {e}")
+            with lock:
+                failed_count += 1
+            return None
+        except KeyError as e:
+            logger.error(f"文档缺少必要字段 {doc_id}: {e}")
+            with lock:
+                failed_count += 1
+            return None
         except Exception as e:
             logger.error(f"生成摘要失败 {doc_id}: {e}")
+            with lock:
+                failed_count += 1
             return None
 
     # 使用 ThreadPoolExecutor 并发处理
@@ -169,10 +274,17 @@ def generate_all_summaries(
                 future.result()  # 异常已在 worker 内处理
                 pbar.update(1)
 
+    # 性能统计
+    elapsed = time.monotonic() - start_time
     logger.info(
-        f"摘要生成完成: {len(doc_memory.memories)}/{len(parsed_files)} 个文档"
-        f" (本次新处理: {len(doc_memory.memories) - skipped})"
+        f"摘要生成完成: {processed_count}/{len(files_to_process)} 个文档成功"
+        f" (失败: {failed_count}), 耗时: {elapsed:.1f}s"
+        f" (本次新处理: {processed_count})"
     )
+    if failed_count > 0:
+        logger.warning(
+            f"有 {failed_count} 个文档处理失败，请检查日志获取详细信息"
+        )
     return doc_memory
 
 
