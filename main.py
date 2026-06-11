@@ -126,14 +126,69 @@ def run_summarize(force: bool = False, max_workers: int = 6):
     logger.info(f"摘要生成完成，消耗: {client.get_usage().summary()}")
 
 
-def run_online(questions_file: str):
-    """运行在线答题"""
+def _collect_question_files(questions_path: str) -> list[Path]:
+    """收集题目文件路径列表，支持单个文件或目录。
+
+    Args:
+        questions_path: 题目文件路径或目录路径。
+
+    Returns:
+        按文件名排序的 JSON 文件路径列表。
+
+    Raises:
+        FileNotFoundError: 路径不存在时抛出。
+        ValueError: 路径存在但既不是文件也不是目录时抛出。
+    """
+    path = Path(questions_path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"路径不存在: {path}")
+
+    if path.is_file():
+        return [path]
+
+    if path.is_dir():
+        json_files = sorted([p for p in path.iterdir() if p.is_file() and p.suffix.lower() == ".json"])
+        return json_files
+
+    raise ValueError(f"路径既不是文件也不是目录: {path}")
+
+
+def run_online(questions_path: str):
+    """运行在线答题，支持单个 JSON 文件或包含多个 JSON 文件的目录。
+
+    断点续跑机制：
+    - 启动时读取 answer.csv，提取已完成的 qid 列表并跳过。
+    - 每处理完一道题目后立即追加写入 CSV（逐题持久化）。
+    - 处理完成后清理可能的重复行。
+
+    Args:
+        questions_path: 题目文件路径或目录路径。
+    """
     from offline.index_builder import SearchIndex
     from memory.doc_memory import DocMemory
     from online.agent_loop import AgentLoop
 
+    # 收集所有题目文件
+    try:
+        question_files = _collect_question_files(questions_path)
+    except (FileNotFoundError, ValueError) as e:
+        logger.error(f"{e}")
+        return
+
+    if not question_files:
+        logger.warning(f"目录中未找到 JSON 文件: {questions_path}")
+        return
+
+    # ── 断点续跑：加载已完成的 qid ──
+    completed_qids = _load_completed_qids()
+    if completed_qids:
+        logger.info(f"检测到已有结果: {len(completed_qids)} 道题目已完成，将跳过")
+
     logger.info("=" * 60)
     logger.info("开始在线答题")
+    logger.info(f"  输入路径: {questions_path}")
+    logger.info(f"  题目文件数: {len(question_files)}")
     logger.info("=" * 60)
 
     # 加载索引
@@ -144,59 +199,188 @@ def run_online(questions_file: str):
     doc_memory = DocMemory()
     doc_memory.load()
 
-    # 加载题目
-    with open(questions_file, "r", encoding="utf-8") as f:
-        questions = json.load(f)
-
-    logger.info(f"加载 {len(questions)} 道题目")
-
-    # 初始化 Agent
+    # 初始化 Agent（全局共享 TokenBudget）
     client = QwenClient()
     token_budget = TokenBudget()
     agent = AgentLoop(client, index, doc_memory, token_budget)
 
-    # 处理所有题目
-    results = agent.process_all(questions)
+    all_results: list[dict] = []
+    total_questions = 0
+    skipped_count = 0
+    processed_count = 0
 
-    # 生成提交文件
-    save_submission(results, token_budget)
+    # 定义逐题回调：处理完一题后立即持久化
+    def on_question_done(result: dict):
+        nonlocal processed_count
+        save_submission(
+            [], token_budget, append=True, single_result=result,
+        )
+        processed_count += 1
+
+    for qfile in question_files:
+        logger.info(f"处理文件: {qfile.name}")
+
+        # 加载题目
+        with open(qfile, "r", encoding="utf-8") as f:
+            questions = json.load(f)
+
+        # 过滤已完成的题目
+        pending_questions = []
+        for q in questions:
+            qid = q.get("qid", "")
+            if qid and qid in completed_qids:
+                skipped_count += 1
+                continue
+            pending_questions.append(q)
+
+        logger.info(f"  加载 {len(questions)} 道题目，跳过 {len(questions) - len(pending_questions)} 道，待处理 {len(pending_questions)} 道")
+        total_questions += len(questions)
+
+        if not pending_questions:
+            continue
+
+        # 处理待处理的题目（带逐题回调）
+        results = agent.process_all(pending_questions, on_question_done=on_question_done)
+        all_results.extend(results)
+
+    # 清理可能的重复行（保留每个 qid 的最后一行）
+    _deduplicate_answer_csv()
+
+    # 最终写入 summary 行
+    save_submission([], token_budget, append=True, write_summary=True)
 
     # 输出统计
     logger.info("=" * 60)
     logger.info(f"答题完成！")
+    logger.info(f"  处理文件数: {len(question_files)}")
+    logger.info(f"  总题目数: {total_questions}")
+    logger.info(f"  跳过（已存在）: {skipped_count}")
+    logger.info(f"  本次处理: {processed_count}")
     logger.info(f"  {client.get_usage().summary()}")
     logger.info(f"  预算使用: {token_budget.used:,}/{token_budget.total_budget:,}")
     logger.info("=" * 60)
 
 
-def save_submission(results: list[dict], token_budget: TokenBudget):
-    """保存提交文件 answer.csv"""
+def _load_completed_qids() -> set[str]:
+    """读取 answer.csv 中已完成的 qid 列表（跳过 summary 行）"""
+    output_path = SUBMISSION_DIR / "answer.csv"
+    completed = set()
+    if not output_path.exists():
+        return completed
+
+    try:
+        with open(output_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)  # 跳过表头
+            if not header:
+                return completed
+            for row in reader:
+                if len(row) >= 1 and row[0] and row[0] != "summary":
+                    completed.add(row[0])
+    except Exception as e:
+        logger.warning(f"读取已有 answer.csv 失败: {e}")
+
+    return completed
+
+
+def _deduplicate_answer_csv():
+    """清理 answer.csv 中的重复 qid 行，保留每个 qid 的最后一行记录"""
+    output_path = SUBMISSION_DIR / "answer.csv"
+    if not output_path.exists():
+        return
+
+    try:
+        # 读取所有行，用 OrderedDict 保留最后出现的记录
+        from collections import OrderedDict
+
+        rows = OrderedDict()
+        summary_row = None
+
+        with open(output_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if not header:
+                return
+
+            for row in reader:
+                if len(row) >= 1 and row[0]:
+                    if row[0] == "summary":
+                        summary_row = row
+                    else:
+                        rows[row[0]] = row
+
+        # 写回文件
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            for row in rows.values():
+                writer.writerow(row)
+            if summary_row:
+                writer.writerow(summary_row)
+
+        logger.info(f"已清理 answer.csv 重复行，保留 {len(rows)} 条唯一记录")
+    except Exception as e:
+        logger.warning(f"清理 answer.csv 重复行失败: {e}")
+
+
+def save_submission(
+    results: list[dict],
+    token_budget: TokenBudget,
+    *,
+    append: bool = False,
+    write_summary: bool = False,
+    single_result: dict | None = None,
+):
+    """保存提交文件 answer.csv
+
+    Args:
+        results: 题目结果列表（批量写入时使用）。
+        token_budget: Token 预算对象。
+        append: 是否以追加模式写入。False 时覆盖写入并写入表头。
+        write_summary: 是否写入 summary 汇总行。
+        single_result: 单题结果（逐题持久化时使用），优先级高于 results。
+    """
     SUBMISSION_DIR.mkdir(parents=True, exist_ok=True)
     output_path = SUBMISSION_DIR / "answer.csv"
 
-    with open(output_path, "w", newline="", encoding="utf-8") as f:
+    mode = "a" if append else "w"
+    with open(output_path, mode, newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["qid", "answer", "prompt_tokens", "completion_tokens", "total_tokens"])
 
-        # 汇总行
-        writer.writerow([
-            "summary", "-",
-            token_budget.used,
-            0,
-            token_budget.used,
-        ])
+        if not append:
+            # 写入表头
+            writer.writerow(["qid", "answer", "prompt_tokens", "completion_tokens", "total_tokens"])
 
-        # 每题数据
-        for r in results:
+        if write_summary:
+            # 汇总行
             writer.writerow([
-                r["qid"],
-                r["answer"],
-                r.get("prompt_tokens", 0),
-                r.get("completion_tokens", 0),
-                r.get("total_tokens", 0),
+                "summary", "-",
+                token_budget.used,
+                0,
+                token_budget.used,
             ])
+        elif single_result is not None:
+            # 逐题写入模式
+            writer.writerow([
+                single_result["qid"],
+                single_result["answer"],
+                single_result.get("prompt_tokens", 0),
+                single_result.get("completion_tokens", 0),
+                single_result.get("total_tokens", 0),
+            ])
+        else:
+            # 批量写入模式
+            for r in results:
+                writer.writerow([
+                    r["qid"],
+                    r["answer"],
+                    r.get("prompt_tokens", 0),
+                    r.get("completion_tokens", 0),
+                    r.get("total_tokens", 0),
+                ])
 
-    logger.info(f"提交文件已保存: {output_path}")
+    if not append or write_summary or single_result is not None:
+        logger.info(f"提交文件已保存: {output_path}")
 
 
 def main():
@@ -204,7 +388,7 @@ def main():
     parser.add_argument("--mode", choices=["offline", "summarize", "online", "all"],
                         default="all", help="运行模式")
     parser.add_argument("--questions", type=str, default="",
-                        help="题目文件路径 (online 模式)")
+                        help="题目文件路径 (online 模式，支持单个 JSON 文件或包含多个 JSON 文件的目录)")
     parser.add_argument("--log-file", type=str, default=None,
                         help="日志文件路径")
     parser.add_argument("--force", action="store_true",

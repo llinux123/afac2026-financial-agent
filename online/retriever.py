@@ -46,6 +46,7 @@ class Retriever:
         all_results: dict[str, tuple[Chunk, float]] = {}
 
         # 1. 用完整问题做 BM25 检索
+        bm25_total_hits = 0
         for query in question.search_queries[:3]:
             results = self.index.search_bm25(
                 query=query,
@@ -53,12 +54,18 @@ class Retriever:
                 top_k=top_k,
                 level="L3",
             )
+            bm25_total_hits += len(results)
             for chunk, score in results:
                 cid = chunk.chunk_id
                 if cid not in all_results or all_results[cid][1] < score:
                     all_results[cid] = (chunk, score)
+        logger.info(
+            f"  [检索-A榜] BM25检索: {len(question.search_queries[:3])}轮query, "
+            f"命中{bm25_total_hits}条, 去重后{len(all_results)}条"
+        )
 
         # 2. 选项增强检索: 每个选项单独检索
+        opt_hit_count = 0
         for opt_key, opt_keywords in question.option_keywords.items():
             if opt_keywords:
                 opt_query = " ".join(opt_keywords[:5])
@@ -68,11 +75,17 @@ class Retriever:
                     top_k=5,
                     level="L3",
                 )
+                opt_hit_count += len(results)
                 for chunk, score in results:
                     cid = chunk.chunk_id
                     adjusted_score = score * 0.8  # 选项检索权重稍低
                     if cid not in all_results or all_results[cid][1] < adjusted_score:
                         all_results[cid] = (chunk, adjusted_score)
+        if question.option_keywords:
+            logger.info(
+                f"  [检索-A榜] 选项增强: {len(question.option_keywords)}个选项, "
+                f"命中{opt_hit_count}条, 累计去重后{len(all_results)}条"
+            )
 
         # 3. 关键词倒排索引补充
         kw_results = self.index.keyword_search(
@@ -80,16 +93,31 @@ class Retriever:
             doc_ids=doc_ids,
             top_k=10,
         )
+        kw_new_count = 0
         for chunk, score in kw_results:
             cid = chunk.chunk_id
             adjusted_score = score * 1.5
+            if cid not in all_results:
+                kw_new_count += 1
             if cid not in all_results or all_results[cid][1] < adjusted_score:
                 all_results[cid] = (chunk, adjusted_score)
+        logger.info(
+            f"  [检索-A榜] 关键词补充: 命中{len(kw_results)}条, 新增{kw_new_count}条, "
+            f"累计{len(all_results)}条"
+        )
 
         # 排序并取 top-K
         sorted_results = sorted(all_results.values(), key=lambda x: -x[1])
+        topk_results = sorted_results[:top_k]
+        topk_detail = ", ".join(
+            f"{chunk.chunk_id}(score={score:.3f})" for chunk, score in topk_results[:5]
+        )
+        logger.info(
+            f"  [检索-A榜] 合并后top-{len(topk_results)}: {topk_detail}"
+            f"{' ...' if len(topk_results) > 5 else ''}"
+        )
         return RetrievalResult(
-            chunks=sorted_results[:top_k],
+            chunks=topk_results,
             located_doc_ids=doc_ids,
             search_method="A榜-BM25+选项增强+关键词",
         )
@@ -109,10 +137,10 @@ class Retriever:
 
         if not located_docs:
             # 降级: 全局 BM25 检索
-            logger.warning(f"  B榜文档定位失败 [{question.qid}]，使用全局检索")
+            logger.warning(f"  [检索-B榜] 文档定位失败 [{question.qid}]，使用全局检索")
             return self._global_fallback(question, top_k)
 
-        logger.debug(f"  B榜定位文档: {located_docs}")
+        logger.info(f"  [检索-B榜] 定位文档: {located_docs}")
 
         # 第二轮: 在定位文档中精细检索 (复用 A榜策略)
         # 临时设置 doc_ids 以复用 A榜逻辑
@@ -150,6 +178,14 @@ class Retriever:
 
         # 收集命中的文档 ID
         hit_docs = list(set(c.doc_id for c, _ in sorted_results[:top_k]))
+        topk_detail = ", ".join(
+            f"{chunk.chunk_id}(score={score:.3f})" for chunk, score in sorted_results[:5]
+        )
+        logger.info(
+            f"  [检索-全局降级] 命中{len(all_results)}条, 涉及文档{len(hit_docs)}篇, "
+            f"top-{min(top_k, len(sorted_results))}: {topk_detail}"
+            f"{' ...' if len(sorted_results) > 5 else ''}"
+        )
 
         return RetrievalResult(
             chunks=sorted_results[:top_k],

@@ -45,6 +45,13 @@ class Reranker:
         if len(candidates) <= 2:
             return chunks, 0
 
+        # 记录重排前顺序
+        before_detail = ", ".join(
+            f"{i+1}.{chunk.chunk_id}(score={score:.3f})"
+            for i, (chunk, score) in enumerate(candidates[:5])
+        )
+        logger.info(f"  [重排序] 重排前top-{len(candidates)}: {before_detail}{' ...' if len(candidates) > 5 else ''}")
+
         # 构建 passages 文本 (截断到 300 字以节省 Token)
         passages_text = ""
         for i, (chunk, score) in enumerate(candidates):
@@ -66,10 +73,20 @@ class Reranker:
         reranked = self._parse_rerank_result(response.content, candidates)
 
         if reranked:
-            logger.debug(f"  重排序完成: {response.content.strip()}, token={response.total_tokens}")
+            after_detail = ", ".join(
+                f"{i+1}.{chunk.chunk_id}(score={score:.3f})"
+                for i, (chunk, score) in enumerate(reranked[:5])
+            )
+            logger.info(
+                f"  [重排序] 重排后top-{len(reranked)}: {after_detail}{' ...' if len(reranked) > 5 else ''}, "
+                f"token={response.total_tokens}"
+            )
             return reranked[:top_k], response.total_tokens
         else:
-            logger.debug(f"  重排序解析失败，保持原序")
+            logger.warning(
+                f"  [重排序] 解析失败，保持原序, raw={response.content.strip()!r}, "
+                f"token={response.total_tokens}"
+            )
             return chunks[:top_k], response.total_tokens
 
     def _parse_rerank_result(

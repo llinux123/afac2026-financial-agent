@@ -1,4 +1,5 @@
 """主控 Agent 循环 - 串行逐题处理"""
+from typing import Callable
 from online.question_analyzer import AnalyzedQuestion, analyze_question
 from online.retriever import Retriever, RetrievalResult
 from online.reranker import Reranker
@@ -65,7 +66,7 @@ class AgentLoop:
         # 4. 检索 (0 Token)
         retrieval = self.retriever.retrieve(analyzed)
         chunks = retrieval.chunks
-        logger.info(f"  检索: {len(chunks)} chunks ({retrieval.search_method})")
+        logger.info(f"  [Agent] 检索完成: {len(chunks)} chunks, 方法={retrieval.search_method}, 定位文档={retrieval.located_doc_ids}")
 
         if not chunks:
             logger.warning(f"  检索无结果 [{qid}]")
@@ -81,11 +82,13 @@ class AgentLoop:
         # 5. 重排序 (条件触发)
         total_api_tokens = 0
         if self.reranker.should_rerank(chunks):
+            logger.info(f"  [Agent] 触发重排序: top1与top5分数接近")
             chunks, rerank_tokens = self.reranker.rerank(
                 analyzed.question, chunks,
             )
             total_api_tokens += rerank_tokens
-            logger.info(f"  重排序完成, +{rerank_tokens} tokens")
+        else:
+            logger.info(f"  [Agent] 跳过重排序: 分数差距足够大")
 
         # 6. 证据压缩
         evidence, compress_tokens = self.compressor.compress(
@@ -144,8 +147,14 @@ class AgentLoop:
     def process_all(
         self,
         questions: list[dict],
+        on_question_done: Callable | None = None,
     ) -> list[dict]:
-        """处理所有题目"""
+        """处理所有题目
+
+        Args:
+            questions: 题目列表。
+            on_question_done: 每处理完一道题目后的回调函数，接收 result dict。
+        """
         results = []
         total = len(questions)
 
@@ -156,7 +165,7 @@ class AgentLoop:
             except Exception as e:
                 qid = q.get("qid", f"q_{i}")
                 logger.error(f"处理失败 [{qid}]: {e}")
-                results.append({
+                result = {
                     "qid": qid,
                     "answer": "A",
                     "prompt_tokens": 0,
@@ -164,6 +173,14 @@ class AgentLoop:
                     "total_tokens": 0,
                     "method": "error",
                     "error": str(e),
-                })
+                }
+                results.append(result)
+
+            # 逐题回调：持久化
+            if on_question_done is not None:
+                try:
+                    on_question_done(result)
+                except Exception as cb_err:
+                    logger.warning(f"逐题回调失败 [{result.get('qid', '?')}]: {cb_err}")
 
         return results
